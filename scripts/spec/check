@@ -14,8 +14,8 @@ default the fetched evidence ref), the author and the approvals on the
 current head; `--forge` reads the last three from the code host. Equal
 inputs give an equal verdict, locally, for an agent and in CI.
 
-The judge's code is the base commit's. CI extracts `lib.JUDGE_PATHS` from
-the base commit and runs that copy with `SPEC_ROOT` naming the head
+The judge's code is the base commit's. CI extracts `lib.JUDGE_PATHS` and
+`REVIEW_AGENTS` from the base commit and runs that copy with `SPEC_ROOT` naming the head
 checkout and `SPEC_JUDGE=base`, so a pull request cannot rewrite the
 judge, `HUMAN_OWNERS`, `AGENT_ACCOUNTS`, `REVIEW_AGENTS` or
 `specs/allowed_signers` that judge it. Run from a checkout with `--base`, this script hands over to
@@ -27,8 +27,10 @@ Rules: V1 class (every changed path has a class, and one class per pull
 request), V2 planning first (`owns` of an item on base that is #active on
 head covers every implementation path), V3 no self-grading, V4 grader
 approval, V5 legal intent, V6 closeout by witness, V7 backlog first, V9
-provenance (warning), V10 frozen area requirements. `--report` prints the
-verdict and exits 0.
+provenance (warning), V10 frozen area requirements, V11 independent review
+(every pull request but a closeout has an approval on its head from
+`HUMAN_OWNERS` or `REVIEW_AGENTS`, and that approval also satisfies V4 and
+V5). `--report` prints the verdict and exits 0.
 """
 
 from __future__ import annotations
@@ -200,7 +202,9 @@ def judge_sides(args: argparse.Namespace, base_sha: str, base: Side, head: Side,
     rules.check_backlog(base.items, head.items, lambda: failing_promises(head), findings)
     rules.check_frozen_areas(base.areas, head.areas, findings)
     approvers = {a.strip() for a in args.approvers.split(",") if a.strip()}
-    rules.judge_approvals(findings, args.author, approvers, set(lib.names(lib.ROOT / "HUMAN_OWNERS")))
+    # V11 exempts a closeout, which V6 judges from a signed witness, and a head
+    # that changes no path.
+    rules.judge_approvals(findings, args.author, approvers, set(lib.names(lib.ROOT / "HUMAN_OWNERS")), reviewable=bool(rows) and kind != "closeout")
 
 
 def classify(path, status, base, head, base_grader, head_new_grader, just_classes, intent_only, findings) -> set[str]:

@@ -27,7 +27,9 @@ If those rules read as ceremony, start with
 as a timeline, with the reason and the enforcing check beside each step. This
 file owns the exact rules; that page explains them.
 [`docs/decisions/work-item-devloop.md`](docs/decisions/work-item-devloop.md)
-owns the rules V1 to V10 and their reasons.
+and
+[`docs/decisions/independent-review.md`](docs/decisions/independent-review.md)
+own the rules V1 to V11 and their reasons.
 
 ## Where work lives
 
@@ -213,10 +215,22 @@ table first. Every `contracts/**/schema.zt` is compiled by
 a schema landed ahead of its implementation is still checked. See
 [docs/decisions/planning-pr-schema-contracts.md](docs/decisions/planning-pr-schema-contracts.md).
 
-### Approvals
+### Reviews and approvals
 
-One approval on the head from a person in `HUMAN_OWNERS`, other than the
-author, is required for each of these (V4):
+Every pull request but a closeout needs one independent review of its current
+head (V11). Two things count, and neither counts from the author:
+
+- an approving review from a person in `HUMAN_OWNERS`;
+- an approving review from an account in `REVIEW_AGENTS`, which is the review
+  agent's verdict.
+
+A comment on the pull request that starts with `@claude review` asks the
+review agent for its verdict on the current head. The `Agent review` workflow
+runs from `main`, posts the findings, and submits an approval when no finding
+is blocking. [`docs/decisions/independent-review.md`](docs/decisions/independent-review.md)
+holds the reasons.
+
+The same review is required by name for each of these (V4):
 
 - a change to the grader set of a bound target, or to a recipe in its closure;
 - a change to an area invariant;
@@ -227,7 +241,7 @@ author, is required for each of these (V4):
 
 A grader file or recipe that grades a promise, meaning an area requirement or
 a terminal item nobody superseded, changes only from a new item. The judge
-reads approvals from the current head, so a new push needs a new approval.
+reads approvals from the current head, so a new push needs a new review.
 An account in `AGENT_ACCOUNTS` never counts as an approval.
 
 ### Work-item requirement
