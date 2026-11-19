@@ -102,9 +102,11 @@ docs_check:
     python3 scripts/check/check-docs.py
 
 # The source budget of slime-root: every Rust file under slime-root/ has exactly one role, and each role
-# and the nine series roles together hold at most their ceiling of code lines. The role table, the
-# ceilings and the pinned dependency names are in scripts/check/check-root-size.py. Reads source text and
-# slime-root/Cargo.toml; builds nothing.
+# and the nine series roles together hold at most their ceiling of code lines. No function holds more
+# than 150 code lines unless the script's table names it, and a named function stays under its own
+# ceiling. The library's fatal! invocations, the lines only the binary compiles and the library's lines
+# behind a cfg each have a ceiling. The tables, the ceilings and the pinned dependency names are in
+# scripts/check/check-root-size.py. Reads source text and slime-root/Cargo.toml; builds nothing.
 [group('quality')]
 [metadata("inputs", "slime-root/**")]
 root_size_check:
@@ -408,7 +410,7 @@ test_sel4_root:
     # another `cfg`: P6's `framebuffer` and `boot_record` are gated to x86-64
     # because the boot framebuffer is reached through an x86 extra-BootInfo
     # record, and their tests are covered by the x86-64 planes instead.
-    expected="$(python3 scripts/check/check-root-size.py --host-tests)"
+    expected="$(python3 scripts/check/check-root-host-tests.py)"
     # Use the toolchain pinned to the installed seL4 prefix, not the ambient one.
     toolchain="$(python3 -c "import pathlib,tomllib; print(tomllib.loads(pathlib.Path('sel4/pins.toml').read_text())['rust_sel4']['toolchain'])")"
     host="$(rustc -vV | sed -n 's/^host: //p')"
