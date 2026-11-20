@@ -334,6 +334,15 @@ zenoh_service_stack_check:
 zenoh_service_holder_fault_check:
     python3 scripts/check/check-zenoh-profile0.py --slice holder-fault
 
+# Judges that the Zenoh service keeps reading the control endpoint of a holder that settled, so the holder gets the
+# denial that the server half already answers and does not block. The judge reads the component's holders.rs and
+# requires two statements to be absent from its code: the one that clears the endpoint after a detach, and the one in
+# reclaim. It refuses ten files. The expectation is scripts/lib/zenoh_lost_holder_exam.py. Nothing here boots QEMU. The recipe fails until
+# the implementation removes the two lines. A boot in which a settled holder sends is not graded.
+[group('hardware')]
+zenoh_service_lost_holder_check:
+    python3 scripts/check/check-zenoh-profile0.py --slice lost-holder
+
 # Judges contracts/frame-store/v1, its Rust reader and its MCAP converter. Converts the LiDAR bag named by
 # SLIME_LIDAR_BAG (refused unless its SHA-256 is the pinned value) twice and compares every payload with the
 # exam's own MCAP reading. The Rust reader must read 70 stores exactly as the exam's decoder does. The
