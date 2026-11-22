@@ -4,6 +4,9 @@
 **Decided by:** the project's human owner, 2026-11-17
 **Amended:** 2026-11-18, by the owner: the fixture role leaves in two steps,
 and a ceiling follows its implementation
+**Amended:** 2026-11-22, by the owner: the policy role and the timer role
+stay, the console dispatcher stays until a design moves it, and both targets
+are withdrawn until the owner restates them from a measured count
 **Related work item:** `root-size-budget`, UUID
 `01a1e925-f21f-7c7b-8c45-b6b46bcefd1e`
 
@@ -41,6 +44,9 @@ policy in components:
 6. The nine series roles reach 23000 code lines or fewer in two stages, as
    `root_size_check` counts them.
 
+The amendment of 2026-11-22 withdraws the numbers of point 6. It also replaces
+three rows of the table below: policy, timer and console.
+
 | Role | Lines | Decision | What stays in the root |
 |---|---|---|---|
 | core | 15037 | stays | all of it |
@@ -54,6 +60,9 @@ policy in components:
 | sharedBuffer | 3026 | leaves in stage two | not decided |
 
 ### Stage one: 28850 lines
+
+The amendment of 2026-11-22 withdraws this target. This section states the
+plan as the owner decided it on 2026-11-17.
 
 The fixture, policy, timer and console roles leave. The dispatch role loses
 its product-name readers. Test-only helpers that sit inside product items move
@@ -80,13 +89,105 @@ is 33200.
 | fixture | Out of the series since PR 1107. |
 | The root names no product component | Done in PR 1117. `just root_size_check` counts 0 string literals that name a product component; it counted 6. |
 | The readers in `ipc.rs` | They stay. The builder states who reads a table, and the root answers from the generation's reader table. The dispatch role holds 2510 lines. |
-| policy, timer and console | Still in the root. The timer role grew to 1435 lines in PR 1118, which added the backend for the BCM2835 system timer. The backend leaves with the role. |
+| policy and timer | They stay, by the amendment of 2026-11-22. The timer role grew to 1435 lines in PR 1118, which added the backend for the BCM2835 system timer. |
+| console | It stays, by the amendment of 2026-11-22, until a design moves the dispatcher. |
+| Test-only helpers inside product items | No item yet. It is the next step. |
 
 The row of 409 lines in the table above assumes that the readers leave the
 root. PR 1117 removed the names and kept the readers. A later design decides
 how a component reads its own rows without a reader in the root. If the
 allowance of stage one does not cover the difference, the owner restates the
 target.
+
+### Amendment of 2026-11-22: the policy and timer roles stay
+
+A survey read the three roles that stage one has leave the root. Most of their
+lines meet condition 1 of the decision, and the rest decide nothing that a
+component could decide in their place. The owner decides:
+
+1. The policy role and the timer role stay in the root.
+2. The dispatcher of the console role stays until the owner accepts a design
+   under `docs/plans/` that moves it. This amendment plans no such design.
+   The root's own diagnostic writer stays in every case.
+3. The targets of 28850 and 23000 lines are withdrawn. The owner restates
+   both from a measured count, after the step of the test-only helpers.
+4. The gate sorts the files of the policy role again, so that the name of a
+   role states what it holds. That moves lines between roles and takes none
+   out of the root.
+
+The counts below are code lines, as `just root_size_check` counts them, on
+`main` at `7e93cf4e`.
+
+| Part of the policy role | Lines | Finding |
+|---|---|---|
+| `notification.rs`, `wait_set.rs` | 337 | They allocate Notification objects from untyped memory, mint badged capabilities in the root CNode, and copy one into a child's CNode. Condition 1 keeps them. |
+| `scheduling.rs` | 179 | A promotion calls `tcb_set_priority` on another task's TCB, with the root's TCB as the authority. Condition 1 keeps it. |
+| `lifecycle.rs`, and its requests in `services/policy.rs` | 709 | The root records why an instance ended and refuses a restart that the generation does not admit. It decides no restart. |
+| `directory.rs` | 337 | The console thread serves two of its three operations. The design of the console dispatcher decides where they go. |
+| Reclaim and memory census in `services/policy.rs` | 165 | Task teardown. It is core mechanism. |
+| Clock requests in `services/policy.rs` | 187 | They serve the timer role. |
+| Supervision and scheduling requests in `services/policy.rs` | 155 | Request decoding for the parts above. |
+
+The policy role holds 2069 lines. Decision point 2 already holds for it: a
+component with supervision authority decides a restart, waits and spawns.
+`robot-supervisor` and `lifecycle-restart-probe` do so today.
+
+`lifecycle.rs` does not move for one reason. `SPAWN` reads the attempt count
+and the backoff instant of an instance in the same step that creates the task.
+The module states the rule: a supervisor that skips its wait is refused, not
+trusted. A component that held those counts would have to be trusted.
+
+The timer role holds 1435 lines, and it does not move for four reasons:
+
+- The root proves its timer in the boot sequence, before a component exists.
+- The root uses the timer queue itself. One slot is reserved for its cleanup
+  retries, and restart admission and the spawn backoff read the clock.
+- The timer's Notification is bound to the root's service thread, so requests
+  and timer delivery share one blocking point and no wake is lost. A component
+  runs at priority 254 or below, and the root above it. A timer component
+  would not preempt the other components.
+- On RISC-V, on x86-64 and in a Raspberry Pi 5 system-timer image, the root
+  answers `CLOCK MONOTONIC READ` for every task.
+
+A timer component would therefore add a second clock and remove none.
+
+The console role holds 443 lines:
+
+| Part of the console role | Lines | Decision |
+|---|---|---|
+| `console.rs`, `graph_runtime/console_runtime.rs` | 300 | The dispatcher: a second root thread that serves debug writes, terminal input and two directory operations. It stays until a design moves it. |
+| `diagnostic.rs`, `graph_runtime/services/diagnostic_once.rs` | 143 | The root's own writer and its once-per-key filter. They stay. |
+
+The dispatcher does not move now, for four reasons:
+
+- A record is whole on the wire because its producer holds a FIFO ticket,
+  and `diagnostic.rs` states that the ticket's waiting rule needs every
+  producer to be a root thread at one priority: a waiter yields, and a yield
+  never schedules an owner of lower priority. A component cannot be a
+  producer under that rule.
+- The root owns its console UART on one target profile,
+  `aarch64-sel4-qemu-virt`. On every other profile its writer calls the
+  kernel's debug console. No component drives the console UART. A component
+  for a 16550 UART exists, `uart16550-driver`, and this tree gives it a line
+  on no platform.
+- The dispatcher maps a caller's frame into the root's VSpace to copy a
+  payload, and it reads the root's authority tables for terminal input and
+  for the two directory operations. No component can do either.
+- `just console_record_check` compiles the dispatcher's write path on the
+  host and pins the bytes of the component runtime's transport. Its own text
+  says that a change of those pins needs a new exam. The plane checkers read
+  component lines and root lines in one transcript and rely on their order.
+
+A move is therefore a design of its own, for about 300 lines. The owner
+weighs it when one exists.
+
+Stage one therefore has one step left: the test-only helpers inside product
+items, about 426 lines. It has no item yet. With it, the series ends near
+32770. The lines that a later decision can still move are in stage two, and in
+the 8164 lines of `object_allocator` that the alternatives below name.
+
+One consequence below no longer holds: a timer wake keeps passing through the
+root.
 
 ### How the fixture role leaves
 
@@ -139,12 +240,18 @@ two does not start before that.
 28660 minus the 6055 lines of the two roles is 22605. The target of 23000
 allows about 395 lines of what stays from every leaving role.
 
+The amendment of 2026-11-22 withdraws this target. The arithmetic above
+starts from 28660, which stage one no longer reaches. From about 32770, the two
+roles leave about 26715, which is above 23000. The owner restates this target
+with that of stage one.
+
 ## Alternatives
 
 - **Restructure without moving anything.** The trusted source stays the same
   size.
 - **Stop after stage one.** The series ends near 28850 lines. This is the
-  outcome if the stage-two design is rejected.
+  outcome if the stage-two design is rejected. Since the amendment of
+  2026-11-22 the series ends near 32770.
 - **A target below 23000.** The `object_allocator` module and its tree hold
   8164 code lines. A lower target needs a simpler adaptive-memory model, which
   is a separate design decision.
@@ -168,6 +275,12 @@ allows about 395 lines of what stays from every leaving role.
 ## Revisit when
 
 - What stays from the leaving roles exceeds the allowance of a stage. The
-  owner then restates that stage's target.
-- The stage-two design is rejected. The target then stays at 28850.
+  owner then restates that stage's target. This happened for stage one on
+  2026-11-22.
+- The verified kernel profile lands. The kernel then exports no generic timer
+  to EL0, and the owner weighs a timer component again.
+- A design under `docs/plans/` moves the console dispatcher. The owner then
+  decides whether it leaves.
+- The stage-two design is rejected. The series then stays where stage one
+  ends.
 - A sixth crate enters the root's dependencies.
