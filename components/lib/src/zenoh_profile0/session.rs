@@ -19,6 +19,7 @@ use super::fragment::{
     FragmentError, PutMessage, PutRules, Source, Splitter, decode_fragment, decode_put,
     fits_one_frame, is_fragment,
 };
+use super::lane::{Lane, decode_lane_frame, is_frame};
 use super::lane_limits::MAX_RUNS_LIMIT;
 use super::limits::{Limits, Mode};
 use super::reassembly::{Progress, Reassembly};
@@ -26,12 +27,17 @@ use super::tables::{InsertError, Keys, SlotTable};
 use super::{
     Bounds, Frame, MAX_BATCH_BYTES, MAX_COOKIE_BYTES, MAX_KEY_BYTES, Mapping, Message, Network,
     Refusal, STREAM_LENGTH_BYTES, decode_batch_client, decode_batch_qos, decode_batch_with,
+    frame_of,
 };
 use slime_proto::zenoh_profile as p;
 
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lane_frames_tests.rs"]
+mod lane_frames_tests;
 
 #[cfg(test)]
 #[path = "lanes_handshake_tests.rs"]
@@ -167,6 +173,29 @@ pub enum SessionError {
     NeedsFragments,
 }
 
+impl SessionError {
+    /// The class name the exams pin: the decoder's own, or the session's.
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::Decode(refusal) => refusal.name(),
+            Self::Encode(_) => "encode",
+            Self::InvalidConfig => "invalid-config",
+            Self::Closed => "closed",
+            Self::NotOpen => "not-open",
+            Self::UnexpectedMessage => "unexpected-message",
+            Self::CookieMismatch => "cookie-mismatch",
+            Self::SequenceMismatch => "sequence-mismatch",
+            Self::SubscriberLimit => "subscriber-limit",
+            Self::UnknownSubscriber => "unknown-subscriber",
+            Self::UndeclaredKey => "undeclared-key",
+            Self::TooManyMessages => "too-many-messages",
+            Self::Fragment(error) => error.class(),
+            Self::OutOfMemory => "out-of-memory",
+            Self::NeedsFragments => "needs-fragments",
+        }
+    }
+}
+
 impl From<Refusal> for SessionError {
     fn from(refusal: Refusal) -> Self {
         Self::Decode(refusal)
@@ -220,6 +249,46 @@ pub enum Event<'a> {
     Closed {
         reason: u8,
     },
+    /// A best-effort frame or run the session did not take. The lane stays open, and the loss is the
+    /// owner's to count. A reliable lane refuses instead.
+    Dropped {
+        priority: u8,
+        cause: DropCause,
+    },
+}
+
+/// Why a best-effort lane dropped what it was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropCause {
+    /// The sequence number is not ahead of the last one taken, by less than 2^31.
+    StaleSequence,
+    /// A FRAME arrived on a lane with a run open, which ends the run.
+    FrameDuringRun,
+    /// A fragment arrived out of order, or the first one of a run was lost.
+    FragmentSequence,
+    /// A fragment of a run that already broke, discarded through its final fragment.
+    Discarded,
+    /// A first fragment with no free run.
+    LaneLimit,
+    /// A run that outlived its timeout.
+    ReassemblyTimeout,
+    /// A message that was taken and then refused. The class is the one a reliable lane returns.
+    Completed(&'static str),
+}
+
+impl DropCause {
+    /// The cause as the exam spells it, `completed` without its class.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::StaleSequence => "stale-sequence",
+            Self::FrameDuringRun => "frame-during-run",
+            Self::FragmentSequence => "fragment-sequence",
+            Self::Discarded => "discarded",
+            Self::LaneLimit => "lane-limit",
+            Self::ReassemblyTimeout => "reassembly-timeout",
+            Self::Completed(_) => "completed",
+        }
+    }
 }
 
 /// Up to `E` events, in the order they happened.
@@ -422,7 +491,6 @@ pub struct SessionOf<
     lease_ms: u64,
     peer_lease_ms: u64,
     tx_sn: u32,
-    rx_sn: u32,
     cookie: [u8; MAX_COOKIE_BYTES],
     cookie_len: usize,
     last_rx_ms: u64,
@@ -438,6 +506,9 @@ pub struct SessionOf<
     runs: usize,
     /// The peer's INIT carried the QoS unit extension.
     peer_qos: bool,
+    /// The next sequence number each lane takes, indexed by [`Lane::index`], and whether the peer's OPEN has
+    /// set it. A lane the peer has not used counts from the number its OPEN announced.
+    lane_sn: [u32; LANES],
     reassembly: Reassembly,
     /// The key aliases a stock peer declared with DeclareKeyExpr, and the keys they stand for.
     aliases: SlotTable<K, B>,
@@ -450,6 +521,33 @@ pub struct SessionOf<
     remote_n: usize,
     /// This connector announces itself as a client and takes the INIT_ACK of a router.
     client: bool,
+}
+
+/// The lanes a session counts: a priority (0 to 7) and a reliability.
+const LANES: usize = 16;
+/// The default lane, which a plain FRAME and a FRAGMENT count on. A session has no other receive counter.
+const DEFAULT_LANE: usize = Lane::DEFAULT.index();
+/// A best-effort sequence number is ahead of the last one taken by less than half the 32-bit range.
+const HALF: u32 = 1 << 31;
+
+/// The events and samples one FRAME can raise, at most `E`.
+fn count_events<const E: usize>(frame: &Frame<'_>) -> (usize, usize) {
+    let mut events = 0;
+    let mut samples = 0;
+    for network in frame.messages() {
+        match network {
+            Network::PushPut { .. } | Network::PushPutAlias { .. } => {
+                events += 1;
+                samples += 1;
+            }
+            Network::DeclareSubscriber { .. }
+            | Network::DeclareSubscriberAlias { .. }
+            | Network::UndeclareSubscriber { .. }
+            | Network::UndeclareSubscriberById { .. } => events += 1,
+            _ => {}
+        }
+    }
+    (events.min(E), samples.min(E))
 }
 
 /// The first release's session.
@@ -525,7 +623,6 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
             lease_ms: config.lease_ms,
             peer_lease_ms: 0,
             tx_sn: config.initial_sn,
-            rx_sn: 0,
             cookie,
             cookie_len,
             last_rx_ms: 0,
@@ -534,6 +631,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
             peer_batch: usize::from(u16::MAX),
             runs,
             peer_qos: false,
+            lane_sn: [0; LANES],
             reassembly: Reassembly::new(params.timeout_ms, params.message_limit),
             aliases: SlotTable::new(),
             subs: SlotTable::new(),
@@ -559,6 +657,12 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
         self.client
     }
 
+    /// The next sequence number `lane` takes. A lane the peer has not used counts from the number its OPEN
+    /// announced.
+    pub const fn lane_next(&self, lane: Lane) -> u32 {
+        self.lane_sn[lane.index()]
+    }
+
     /// Whether this side offers the QoS unit extension on its INIT: it holds 2 or more runs.
     const fn offers_qos(&self) -> bool {
         self.runs >= 2
@@ -581,7 +685,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
         if self.state != State::Open {
             return Err(SessionError::UnexpectedMessage);
         }
-        if sn != self.rx_sn {
+        if sn != self.lane_sn[DEFAULT_LANE] {
             return Err(SessionError::SequenceMismatch);
         }
         Ok(())
@@ -591,7 +695,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
     /// frame renews the lease. It stamps the clock as `on_batch_with` does for a plain session's accepted
     /// FRAME, without a `max`: only `tick` keeps the latest time a call gave the session.
     pub(super) fn graph_frame_accepted(&mut self, now_ms: u64) {
-        self.rx_sn = self.rx_sn.wrapping_add(1);
+        self.lane_sn[DEFAULT_LANE] = self.lane_sn[DEFAULT_LANE].wrapping_add(1);
         self.last_rx_ms = now_ms;
         self.now_ms = now_ms;
     }
@@ -669,7 +773,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
 
     /// The sequence number the next received reliable FRAME must carry; meaningful once open.
     pub const fn expected_rx_sn(&self) -> u32 {
-        self.rx_sn
+        self.lane_sn[DEFAULT_LANE]
     }
 
     /// The lease the peer announced, 0 until the handshake completes.
@@ -840,6 +944,9 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
             self.now_ms = now_ms;
             return Ok(outcome);
         }
+        if self.lanes() && !self.client && batch.first().copied().is_some_and(is_frame) {
+            return self.on_lane_frame(batch, now_ms);
+        }
         let message = self.decode(batch)?;
         self.on_message(message, now_ms, out)
     }
@@ -864,25 +971,26 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
             let last = batch.first().is_some_and(|header| header & 0x40 == 0);
             return (usize::from(last), usize::from(last));
         }
-        match decode_batch_with(batch, &self.params.bounds) {
-            Ok(Message::Frame(frame)) => {
-                let mut events = 0;
-                let mut samples = 0;
-                for network in frame.messages() {
-                    match network {
-                        Network::PushPut { .. } | Network::PushPutAlias { .. } => {
-                            events += 1;
-                            samples += 1;
+        // A FRAME on a negotiated link is read by its lane. A best-effort FRAME the lane drops raises one event
+        // and no sample, and the estimate of a FRAME that delivers is the larger of the two, so the room it
+        // asks for covers both.
+        if self.lanes() && !self.client && batch.first().copied().is_some_and(is_frame) {
+            return match decode_lane_frame(batch) {
+                Ok(header) => {
+                    let dropped = usize::from(!header.lane.reliable);
+                    match frame_of(header.sn, header.body, &self.params.bounds) {
+                        Ok(frame) => {
+                            let (events, samples) = count_events::<E>(&frame);
+                            (events.max(dropped), samples)
                         }
-                        Network::DeclareSubscriber { .. }
-                        | Network::DeclareSubscriberAlias { .. }
-                        | Network::UndeclareSubscriber { .. }
-                        | Network::UndeclareSubscriberById { .. } => events += 1,
-                        _ => {}
+                        Err(_) => (dropped, 0),
                     }
                 }
-                (events.min(E), samples.min(E))
-            }
+                Err(_) => (0, 0),
+            };
+        }
+        match decode_batch_with(batch, &self.params.bounds) {
+            Ok(Message::Frame(frame)) => count_events::<E>(&frame),
             Ok(Message::OpenSyn { .. } | Message::OpenAck { .. } | Message::Close { .. }) => (1, 0),
             _ => (0, 0),
         }
@@ -1011,7 +1119,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
             return Err(SessionError::Decode(Refusal::LengthExceedsBatch));
         }
         self.peer_lease_ms = lease_ms;
-        self.rx_sn = initial_sn;
+        self.lane_sn = [initial_sn; LANES];
         self.state = State::Open;
         Ok(Outcome::sending(sent).with(Event::HandshakeComplete))
     }
@@ -1025,7 +1133,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
             return Err(SessionError::UnexpectedMessage);
         }
         self.peer_lease_ms = lease_ms;
-        self.rx_sn = initial_sn;
+        self.lane_sn = [initial_sn; LANES];
         self.state = State::Open;
         Ok(Outcome::nothing().with(Event::HandshakeComplete))
     }
@@ -1071,7 +1179,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
             self.reassembly.release();
             return Err(SessionError::UnexpectedMessage);
         }
-        if frame.sn != self.rx_sn {
+        if frame.sn != self.lane_sn[DEFAULT_LANE] {
             return Err(SessionError::SequenceMismatch);
         }
         let mut journal = [None; JOURNAL];
@@ -1084,7 +1192,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
                         self.subs.settle(at);
                     }
                 }
-                self.rx_sn = self.rx_sn.wrapping_add(1);
+                self.lane_sn[DEFAULT_LANE] = self.lane_sn[DEFAULT_LANE].wrapping_add(1);
                 Ok(Outcome { sent: 0, events })
             }
             Err(error) => {
@@ -1102,6 +1210,91 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
                     }
                 }
                 Err(error)
+            }
+        }
+    }
+
+    /// One FRAME on a negotiated link, taken by the lane its header names. A reliable lane takes exactly its
+    /// next number and refuses anything else, as a link with one lane does. A best-effort lane takes a number
+    /// ahead of the last one, counts the gap and delivers; it drops a number that is not ahead and reports
+    /// it. The network messages are validated and applied as a plain FRAME's are.
+    fn on_lane_frame<'a>(
+        &mut self,
+        batch: &'a [u8],
+        now_ms: u64,
+    ) -> Result<Outcome<'a, E>, SessionError> {
+        if self.state != State::Open {
+            return Err(SessionError::UnexpectedMessage);
+        }
+        let header = decode_lane_frame(batch)?;
+        let lane = header.lane;
+        let next = self.lane_sn[lane.index()];
+        if lane.reliable {
+            // The session holds one run, on the default lane, so a reliable FRAME on another lane may
+            // arrive inside it. A reliable FRAME on the lane of the open run ends the run, as a plain FRAME does.
+            if lane == Lane::DEFAULT && self.reassembly.is_open() {
+                self.reassembly.release();
+                return Err(SessionError::UnexpectedMessage);
+            }
+            if header.sn != next {
+                return Err(SessionError::SequenceMismatch);
+            }
+        } else if header.sn.wrapping_sub(next) >= HALF - 1 {
+            // Upstream measures from the last number taken, one below the count held here, so a number
+            // is ahead by 1 to 2^31 - 1 of it, which is 0 to 2^31 - 2 of the count.
+            return Ok(Outcome::nothing().with(Event::Dropped {
+                priority: lane.priority,
+                cause: DropCause::StaleSequence,
+            }));
+        }
+        let mut journal = [None; JOURNAL];
+        let mut used = 0;
+        let mut events = Events::empty();
+        let applied = match frame_of(header.sn, header.body, &self.params.bounds) {
+            Ok(frame) => self.apply_frame(&frame, &mut journal, &mut used, &mut events),
+            Err(refusal) => Err(refusal.into()),
+        };
+        match applied {
+            Ok(()) => {
+                for change in journal.iter().take(used).flatten() {
+                    if let Change::Unsubscribed(at) = *change {
+                        self.subs.settle(at);
+                    }
+                }
+                self.lane_sn[lane.index()] = header.sn.wrapping_add(1);
+                self.last_rx_ms = now_ms;
+                self.now_ms = now_ms;
+                Ok(Outcome { sent: 0, events })
+            }
+            Err(error) if lane.reliable => {
+                self.undo(&journal, used);
+                Err(error)
+            }
+            Err(error) => {
+                self.undo(&journal, used);
+                // The number was ahead, so the lane moves past it: the sender will not send it again.
+                self.lane_sn[lane.index()] = header.sn.wrapping_add(1);
+                Ok(Outcome::nothing().with(Event::Dropped {
+                    priority: lane.priority,
+                    cause: DropCause::Completed(error.class()),
+                }))
+            }
+        }
+    }
+
+    /// Undoes the table changes of a FRAME that failed midway, newest first.
+    fn undo(&mut self, journal: &[Option<Change>; JOURNAL], used: usize) {
+        for change in journal.iter().take(used).rev().flatten() {
+            match *change {
+                Change::Alias(at) => self.aliases.remove(at),
+                Change::Subscribed(at) => {
+                    self.subs.remove(at);
+                    self.remote_n -= 1;
+                }
+                Change::Unsubscribed(at) => {
+                    self.subs.restore(at);
+                    self.remote_n += 1;
+                }
             }
         }
     }
@@ -1234,9 +1427,9 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
                 return Err(error.into());
             }
         };
-        let progress = self
-            .reassembly
-            .accept(&fragment, cell, self.rx_sn, now_ms)?;
+        let progress =
+            self.reassembly
+                .accept(&fragment, cell, self.lane_sn[DEFAULT_LANE], now_ms)?;
         if progress == Progress::Open {
             return Ok(Outcome::nothing());
         }
@@ -1257,7 +1450,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
             offset,
             len: view.payload.len(),
         };
-        self.rx_sn = next;
+        self.lane_sn[DEFAULT_LANE] = next;
         Ok(Outcome::nothing().with(event))
     }
 
