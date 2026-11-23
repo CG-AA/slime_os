@@ -112,9 +112,11 @@ import hashlib
 import os as _os
 import re
 import shutil
+import signal as _signal
 import struct
 import subprocess
 import tempfile
+import time as _time
 from collections.abc import Callable
 from typing import NoReturn
 
@@ -128,6 +130,7 @@ import zenoh_rmw_peer_component_exam
 import zenoh_rmw_data_exam
 import zenoh_rmw_client_exam
 import zenoh_rmw_client_put_exam
+import zenoh_rmw_live_exam
 import zenoh_rmw_router
 import zenoh_rmw_router_data
 import zenoh_rmw_router_link_exam
@@ -2370,6 +2373,138 @@ def rmw_client_put_main(controls_only: bool) -> int:
     return 0
 
 
+LIVE_CRATE = ROOT / "verification" / "zenoh-live"
+# The ROS environment is read from the operator's shell, never from a path this checker invents: the pinned packages are
+# not in `flake.nix`, so the operator names them. A missing variable is a refusal, not a skipped run.
+LIVE_ENVIRONMENT = ("SLIME_ROS_ENV", "SLIME_RMW_ZENOHD", "SLIME_ROS_TALKER", "SLIME_ROS_LISTENER")
+LIVE_ROUTER_PORT = 7447
+LIVE_SETTLE_S = 3
+LIVE_PROGRAM_S = 60
+LISTENER_LINE = re.compile(r"I heard: \[(Hello Slime \d+)\]")
+
+
+def live_environment() -> dict[str, str]:
+    missing = [name for name in LIVE_ENVIRONMENT if not _os.environ.get(name)]
+    if missing:
+        fail(f"rmw-live: the operator's environment names no {', '.join(missing)}; a live run needs a router and two ROS nodes")
+    ros = _os.environ["SLIME_ROS_ENV"]
+    return {
+        **_os.environ,
+        "AMENT_PREFIX_PATH": ros,
+        "LD_LIBRARY_PATH": f"{ros}/lib",
+        "RMW_IMPLEMENTATION": "rmw_zenoh_cpp",
+        "ROS_DOMAIN_ID": "0",
+    }
+
+
+def live_start(command: list[str], environment: dict[str, str], pids: list[int], stdout, stderr=subprocess.DEVNULL) -> subprocess.Popen:
+    """Starts a process in its own session and records its PID, so every process this checker starts is killed by PID."""
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, env=environment, start_new_session=True)
+    pids.append(process.pid)
+    return process
+
+
+def live_stop(pids: list[int]) -> None:
+    for pid in pids:
+        try:
+            _os.killpg(pid, _signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    pids.clear()
+
+
+LIVE_PREFIX = "[zenoh-live] "
+
+
+def live_program_lines(stdout: str) -> list[str]:
+    """The lines the program printed, without their prefix. The program writes `live ...` lines and no other kind: the
+    `ros` lines are the checker's, read from the listener, so a program line of any other kind is refused."""
+    kept: list[str] = []
+    for line in stdout.splitlines():
+        if not line.startswith(LIVE_PREFIX):
+            continue
+        text = line.removeprefix(LIVE_PREFIX)
+        if not text.startswith("live "):
+            fail(f"rmw-live: the program printed a line that is not a `live` line: {text!r}")
+        kept.append(text)
+    return kept
+
+
+def run_rmw_live() -> list[str]:
+    environment = live_environment()
+    host = subprocess.run(["rustc", "-vV"], capture_output=True, text=True, check=True)
+    target = next(line.split(": ", 1)[1] for line in host.stdout.splitlines() if line.startswith("host: "))
+    program = ["cargo", "run", "--release", "--target", target, "--manifest-path", str(LIVE_CRATE / "Cargo.toml"), "--"]
+    lines: list[str] = []
+    pids: list[int] = []
+    try:
+        # Inbound: a router and a talker, and the program subscribes. The program prints every line of this direction.
+        live_start([environment["SLIME_RMW_ZENOHD"]], environment, pids, subprocess.DEVNULL)
+        _time.sleep(LIVE_SETTLE_S)
+        live_start([environment["SLIME_ROS_TALKER"]], environment, pids, subprocess.DEVNULL)
+        _time.sleep(LIVE_SETTLE_S)
+        inbound = subprocess.run([*program, "inbound"], cwd=ROOT, capture_output=True, text=True, env=environment, timeout=LIVE_PROGRAM_S)
+        if inbound.returncode != 0:
+            _sys.stderr.write((inbound.stdout + inbound.stderr)[-4000:])
+            fail(f"rmw-live: the live program exited {inbound.returncode} in the inbound direction")
+        lines += live_program_lines(inbound.stdout)
+        live_stop(pids)
+        # Outbound: a new router and a listener, and the program writes. The listener's output is read here, not by the
+        # program. `demo_nodes_cpp` logs through rcutils, which writes to stderr, so the log takes both streams.
+        listener_log = ROOT / "build" / "zenoh-live" / "listener.txt"
+        listener_log.parent.mkdir(parents=True, exist_ok=True)
+        live_start([environment["SLIME_RMW_ZENOHD"]], environment, pids, subprocess.DEVNULL)
+        _time.sleep(LIVE_SETTLE_S)
+        with listener_log.open("wb") as sink:
+            live_start([environment["SLIME_ROS_LISTENER"]], environment, pids, sink, subprocess.STDOUT)
+            _time.sleep(LIVE_SETTLE_S)
+            outbound = subprocess.run([*program, "outbound"], cwd=ROOT, capture_output=True, text=True, env=environment, timeout=LIVE_PROGRAM_S)
+            _time.sleep(LIVE_SETTLE_S)
+        if outbound.returncode != 0:
+            _sys.stderr.write((outbound.stdout + outbound.stderr)[-4000:])
+            fail(f"rmw-live: the live program exited {outbound.returncode} in the outbound direction")
+        lines += live_program_lines(outbound.stdout)
+        # The ROS lines are the listener's own, in the order it printed them. They are placed before the close line.
+        heard = [match.group(1) for line in listener_log.read_text(errors="replace").splitlines() if (match := LISTENER_LINE.search(line))]
+        closed = [line for line in lines if line.startswith("live closed ")]
+        lines = [line for line in lines if not line.startswith("live closed ")]
+        lines += [f"ros listener I_heard:_[{text.replace(' ', '_')}]" for text in heard]
+        lines += closed
+    except subprocess.TimeoutExpired:
+        fail(f"rmw-live: the live program did not finish in {LIVE_PROGRAM_S} s")
+    finally:
+        live_stop(pids)
+    return lines
+
+
+def rmw_live_main(controls_only: bool) -> int:
+    exam = zenoh_rmw_live_exam
+    try:
+        refused_controls = exam.all_controls()
+        item_cases, item_controls = exam.item_pins()
+    except exam.LiveExamError as error:
+        fail(str(error))
+    if refused_controls != exam.PINNED_CONTROLS:
+        fail(f"rmw-live: {refused_controls} controls, the checker pins {exam.PINNED_CONTROLS}")
+    if item_cases and item_cases != exam.MIN_CASES:
+        fail(f"rmw-live: the item fixes at least {item_cases} cases, the checker pins {exam.MIN_CASES}")
+    if item_controls and item_controls != exam.PINNED_CONTROLS:
+        fail(f"rmw-live: the item requires {item_controls} controls, the checker pins {exam.PINNED_CONTROLS}")
+    if controls_only:
+        print(f"zenoh profile 0 rmw-live judge: refused {refused_controls} corrupted transcripts")
+        return 0
+    try:
+        cases, _ = exam.judge(run_rmw_live())
+    except exam.LiveExamError as error:
+        fail(str(error))
+    if cases < exam.MIN_CASES:
+        fail(f"rmw-live: {cases} cases, the item fixes at least {exam.MIN_CASES}")
+    print(f"[zenoh-profile0] slice=rmw-live cases={cases} controls={refused_controls}")
+    devloop_observations.record(casesObserved=cases, negativeControlsRefused=refused_controls)
+    print("zenoh profile 0 rmw-live check: a client-role link exchanged samples with a ROS talker and a ROS listener through rmw_zenohd")
+    return 0
+
+
 def rmw_data_link_main(controls_only: bool) -> int:
     try:
         zenoh_rmw_exam.all_controls()
@@ -3626,7 +3761,7 @@ def lost_holder_main(controls_only: bool) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--slice", choices=(*JUDGES, "composition", "xcheck", "stock", "links", "undeclare", "rmw", "rmw-graph", "rmw-link", "rmw-data", "rmw-data-link", "rmw-client", "rmw-router-link", "rmw-client-put", "rmw-component", "rmw-peer", "rmw-booted", "subscribers", "lanes", "link-limits-v3", "grants", "client", "client-wire", "client-io", "client-abort", "grants-table", "grants-reader", "server", "grading", "limits", "service-component", "service-booted", "service-peer", "service-four", "service", "service-link", "holder-fault", "service-stack", "lost-holder"), required=True)
+    parser.add_argument("--slice", choices=(*JUDGES, "composition", "xcheck", "stock", "links", "undeclare", "rmw", "rmw-graph", "rmw-link", "rmw-data", "rmw-data-link", "rmw-client", "rmw-router-link", "rmw-client-put", "rmw-live", "rmw-component", "rmw-peer", "rmw-booted", "subscribers", "lanes", "link-limits-v3", "grants", "client", "client-wire", "client-io", "client-abort", "grants-table", "grants-reader", "server", "grading", "limits", "service-component", "service-booted", "service-peer", "service-four", "service", "service-link", "holder-fault", "service-stack", "lost-holder"), required=True)
     parser.add_argument("--controls-only", action="store_true")
     arguments = parser.parse_args()
     if arguments.slice == "composition":
@@ -3655,6 +3790,8 @@ def main() -> int:
         return rmw_router_link_main(arguments.controls_only)
     if arguments.slice == "rmw-client-put":
         return rmw_client_put_main(arguments.controls_only)
+    if arguments.slice == "rmw-live":
+        return rmw_live_main(arguments.controls_only)
     if arguments.slice == "rmw-data":
         return rmw_data_main(arguments.controls_only)
     if arguments.slice == "rmw-graph":
