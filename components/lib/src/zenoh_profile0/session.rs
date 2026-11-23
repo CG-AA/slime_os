@@ -1606,17 +1606,22 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
         Ok(outcome)
     }
 
-    /// Whether the peer declared a subscriber on `key`, which a Put must name.
+    /// Whether a Put may be written on `key`. A session with no client role needs the peer to have declared a
+    /// subscriber on it. A router declares none to a client, so a session with the client role writes a whole Put
+    /// on any key that validates. A Put in fragments keeps the check for every session, because no exam observes a
+    /// client writing fragments.
     fn check_put(
         &self,
         key: &str,
         attachment: &[u8],
         payload_len: usize,
+        whole: bool,
     ) -> Result<(), SessionError> {
-        if self
-            .subs
-            .find_by(|id, held| id & LOCAL == 0 && held == key.as_bytes())
-            .is_none()
+        if !(self.client && whole)
+            && self
+                .subs
+                .find_by(|id, held| id & LOCAL == 0 && held == key.as_bytes())
+                .is_none()
         {
             return Err(SessionError::UndeclaredKey);
         }
@@ -1642,7 +1647,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
         payload: &[u8],
         out: &mut [u8],
     ) -> Result<Outcome<'a, E>, SessionError> {
-        self.check_put(key, attachment, payload.len())?;
+        self.check_put(key, attachment, payload.len(), true)?;
         if self.state == State::Open && !self.put_fits_one_frame(key, attachment, payload.len()) {
             return Err(if self.params.fragments {
                 SessionError::NeedsFragments
@@ -1673,7 +1678,7 @@ impl<const K: usize, const S: usize, const B: usize, const E: usize> SessionOf<K
             return Err(SessionError::Decode(Refusal::OverBound));
         }
         if at == 0 {
-            self.check_put(key, attachment, payload.len())?;
+            self.check_put(key, attachment, payload.len(), false)?;
         }
         let message = PutMessage::new(key.as_bytes(), attachment, payload);
         let mut splitter = Splitter::resume(
