@@ -133,6 +133,159 @@ def undeclare_subscriber_by_id(sub_id: int) -> bytes:
     return bytes([ID_DECLARE | FLAG_Z, EXT_QOS_NETWORK, QOS_NETWORK_DEFAULT, ID_U_SUBSCRIBER]) + leb128(sub_id)
 
 
+WHATAMI_ROUTER = 0
+WHATAMI_CLIENT = 2
+ID_D_TOKEN, ID_U_TOKEN, ID_D_FINAL, ID_INTEREST = 6, 7, 0x1A, 25
+INTEREST_MODES = {"final": 0, "current": 1, "future": 2, "current-future": 3}
+INTEREST_TOKENS = 0x08
+QOS_DECLARE = bytes([EXT_QOS_NETWORK, QOS_NETWORK_DEFAULT])
+
+
+def init_as(whatami: int, zid: bytes, batch: int = DEFAULT_BATCH) -> bytes:
+    """INIT_SYN for any role: the role is the low two bits of the byte after the version."""
+    if whatami not in (WHATAMI_ROUTER, WHATAMI_PEER, WHATAMI_CLIENT):
+        raise WireError("0b11 is reserved")
+    syn = init(zid, batch)
+    at = 2
+    return syn[:at] + bytes([(syn[at] & ~0x03) | whatami]) + syn[at + 1 :]
+
+
+def _declare(body: bytes, interest_id: int | None) -> bytes:
+    header = ID_DECLARE | FLAG_Z | (FLAG_A if interest_id is not None else 0)
+    return bytes([header]) + (leb128(interest_id) if interest_id is not None else b"") + QOS_DECLARE + body
+
+
+def declare_token(token_id: int, key: str, sender: bool, interest_id: int | None = None) -> bytes:
+    """D_TKN as upstream 1.0.0 writes it: the network QoS extension on the DECLARE, and an interest id first
+    when the declaration answers an INTEREST."""
+    header = ID_D_TOKEN | FLAG_N | (FLAG_M if sender else 0)
+    return _declare(bytes([header]) + leb128(token_id) + leb128(0) + prefixed(key.encode()), interest_id)
+
+
+def undeclare_token(token_id: int, key: str | None = None, sender: bool = True) -> bytes:
+    """U_TKN. Upstream always writes the wire-expression extension, with a null expression when it has no key."""
+    if key is None:
+        body = bytes([0x00]) + leb128(0)
+    else:
+        body = bytes([0x01 | (0x02 if sender else 0)]) + leb128(0) + key.encode()
+    return _declare(bytes([ID_U_TOKEN | FLAG_Z]) + leb128(token_id) + bytes([EXT_WIRE_EXPR]) + prefixed(body), None)
+
+
+def declare_final(interest_id: int) -> bytes:
+    return _declare(bytes([ID_D_FINAL]), interest_id)
+
+
+INTEREST_RESTRICTED = 0x70  # R, N and M: a named key of the sender's mapping follows the options byte
+
+
+def interest(
+    interest_id: int,
+    mode: str,
+    options: int = INTEREST_TOKENS,
+    key: str | None = None,
+    qos: bool = False,
+) -> bytes:
+    """INTEREST: the mode in bits 5 and 6, then the id and, but for Final, the options byte. A `key` restricts it
+    and adds R, N and M to the options and the key after them. `qos` adds the network QoS extension upstream writes
+    when the QoS is not the default, and sets the extension flag."""
+    header = ID_INTEREST | (INTEREST_MODES[mode] << 5) | (FLAG_Z if qos else 0)
+    out = bytes([header]) + leb128(interest_id)
+    if mode != "final":
+        out += bytes([options | (INTEREST_RESTRICTED if key is not None else 0)])
+        if key is not None:
+            out += leb128(0) + prefixed(key.encode())
+    if qos:
+        out += bytes([EXT_QOS_NETWORK, QOS_NETWORK_DEFAULT])
+    return out
+
+
+def undeclare_token_by_id(token_id: int) -> bytes:
+    """The withdrawal the client-role link writes: a bare DECLARE, U_TKN with its extension flag, the id and the
+    extension `5f 02 00 00` that `rmw_zenohd`'s own client sent (scripts/lib/zenoh_rmw_token_exam.py)."""
+    return bytes([ID_DECLARE, ID_U_TOKEN | FLAG_Z]) + leb128(token_id) + bytes([EXT_WIRE_EXPR, 0x02, 0x00, 0x00])
+
+
+KEY_LIVELINESS = "@/liveliness/slime/node"
+KEY_ROS = "@ros2_lv/0"
+INTEREST_KEYEXPRS = 0x01
+
+# Bytes the upstream eclipse-zenoh 1.0.0 encoder produced for each message below (zenoh-protocol and
+# zenoh-codec =1.0.0, a throwaway program that wrote them and read them back). `liveliness_self_test`
+# reproduces every one, so this reference is trusted only after it matches upstream.
+UPSTREAM_LIVELINESS = {
+    "init_syn_peer_default": "01093111223344",
+    "init_syn_client_default": "01093211223344",
+    "init_syn_router_default": "01093011223344",
+    "init_syn_client_512": "410932112233440a0002",
+    "declare_token_sender_id1_sn5": "25059e210866010017402f6c6976656c696e6573732f736c696d652f6e6f6465",
+    "declare_token_receiver_id1_sn5": "25059e210826010017402f6c6976656c696e6573732f736c696d652f6e6f6465",
+    "declare_token_sender_id300_sn5": "25059e210866ac020017402f6c6976656c696e6573732f736c696d652f6e6f6465",
+    "declare_token_for_interest7_sn5": "2505be07210866010017402f6c6976656c696e6573732f736c696d652f6e6f6465",
+    "undeclare_token_by_id1_sn6": "25069e210887015f020000",
+    "undeclare_token_with_key_id1_sn6": "25069e210887015f190300402f6c6976656c696e6573732f736c696d652f6e6f6465",
+    "declare_final_interest7_sn9": "2509be0721081a",
+    "interest_tokens_current_id7_sn2": "2502390708",
+    "interest_tokens_future_id7_sn2": "2502590708",
+    "interest_tokens_current_future_id7_sn2": "2502790708",
+    "interest_final_id7_sn3": "25031907",
+    "interest_subscribers_current_id7_sn2": "2502390702",
+    "interest_tokens_qos_id7_sn2": "2502b907082108",
+    "interest_restricted_exact_id7_sn2": "25023907780017402f6c6976656c696e6573732f736c696d652f6e6f6465",
+    "interest_restricted_wildcard_id7_sn2": "25023907780015402f6c6976656c696e6573732f736c696d652f2a2a",
+    "interest_keyexprs_tokens_restricted_wildcard_id7_sn2": "25023907790015402f6c6976656c696e6573732f736c696d652f2a2a",
+    "interest_keyexprs_tokens_restricted_wildcard_qos_id7_sn2": "2502b907790015402f6c6976656c696e6573732f736c696d652f2a2a2108",
+    "interest_keyexprs_tokens_restricted_ros_id7_sn2": "2502390779000d40726f73325f6c762f302f2a2a",
+    "interest_keyexprs_tokens_unrestricted_id7_sn2": "2502390709",
+}
+
+
+def liveliness_reference() -> dict[str, str]:
+    zid = bytes.fromhex("11223344")
+    key = KEY_LIVELINESS
+    return {
+        "init_syn_peer_default": init_as(WHATAMI_PEER, zid).hex(),
+        "init_syn_client_default": init_as(WHATAMI_CLIENT, zid).hex(),
+        "init_syn_router_default": init_as(WHATAMI_ROUTER, zid).hex(),
+        "init_syn_client_512": init_as(WHATAMI_CLIENT, zid, 512).hex(),
+        "declare_token_sender_id1_sn5": frame(5, declare_token(1, key, True)).hex(),
+        "declare_token_receiver_id1_sn5": frame(5, declare_token(1, key, False)).hex(),
+        "declare_token_sender_id300_sn5": frame(5, declare_token(300, key, True)).hex(),
+        "declare_token_for_interest7_sn5": frame(5, declare_token(1, key, True, 7)).hex(),
+        "undeclare_token_by_id1_sn6": frame(6, undeclare_token(1)).hex(),
+        "undeclare_token_with_key_id1_sn6": frame(6, undeclare_token(1, key)).hex(),
+        "declare_final_interest7_sn9": frame(9, declare_final(7)).hex(),
+        "interest_tokens_current_id7_sn2": frame(2, interest(7, "current")).hex(),
+        "interest_tokens_future_id7_sn2": frame(2, interest(7, "future")).hex(),
+        "interest_tokens_current_future_id7_sn2": frame(2, interest(7, "current-future")).hex(),
+        "interest_final_id7_sn3": frame(3, interest(7, "final")).hex(),
+        "interest_subscribers_current_id7_sn2": frame(2, interest(7, "current", 0x02)).hex(),
+        "interest_tokens_qos_id7_sn2": frame(2, interest(7, "current", qos=True)).hex(),
+        "interest_restricted_exact_id7_sn2": frame(2, interest(7, "current", key=key)).hex(),
+        "interest_restricted_wildcard_id7_sn2": frame(2, interest(7, "current", key="@/liveliness/slime/**")).hex(),
+        "interest_keyexprs_tokens_restricted_wildcard_id7_sn2": frame(
+            2, interest(7, "current", INTEREST_TOKENS | INTEREST_KEYEXPRS, "@/liveliness/slime/**")
+        ).hex(),
+        "interest_keyexprs_tokens_restricted_wildcard_qos_id7_sn2": frame(
+            2, interest(7, "current", INTEREST_TOKENS | INTEREST_KEYEXPRS, "@/liveliness/slime/**", qos=True)
+        ).hex(),
+        "interest_keyexprs_tokens_restricted_ros_id7_sn2": frame(
+            2, interest(7, "current", INTEREST_TOKENS | INTEREST_KEYEXPRS, f"{KEY_ROS}/**")
+        ).hex(),
+        "interest_keyexprs_tokens_unrestricted_id7_sn2": frame(2, interest(7, "current", INTEREST_TOKENS | INTEREST_KEYEXPRS)).hex(),
+    }
+
+
+def liveliness_self_test() -> int:
+    """Reproduce every upstream batch above; returns how many matched."""
+    produced = liveliness_reference()
+    if produced.keys() != UPSTREAM_LIVELINESS.keys():
+        raise WireError("the liveliness reference and the upstream table name different batches")
+    for name, expected in UPSTREAM_LIVELINESS.items():
+        if produced[name] != expected:
+            raise WireError(f"{name}: reference produced {produced[name]}, upstream bytes are {expected}")
+    return len(produced)
+
+
 def attachment(sequence: int, timestamp: int, gid: bytes) -> bytes:
     if len(gid) != GID_BYTES:
         raise WireError("the profile admits only a 16-byte GID")

@@ -261,6 +261,16 @@ zenoh_qos_check:
 zenoh_congestion_check:
     python3 scripts/check/check-zenoh-profile0.py --slice congestion
 
+# Judges the answer a client-role Zenoh Profile 0 session gives a router's INTEREST for tokens: a
+# DECLARE_TOKEN for each token it holds whose key the INTEREST selects, each carrying the interest id, then a
+# DeclareFinal. It also judges a listener that takes a Client INIT_SYN only when configured to. The host
+# reference reproduces 23 batches the upstream eclipse-zenoh 1.0.0 encoder wrote before it judges the session's
+# frames (scripts/lib/zenoh_liveliness_exam.py, zenoh_wire.py). The links and stock-peer exams run beside it.
+# Nothing here needs a registry. The recipe fails until the session answers an INTEREST.
+[group('hardware')]
+zenoh_liveliness_check:
+    python3 scripts/check/check-zenoh-profile0.py --slice liveliness
+
 # Judges what the Zenoh service may do for each holder. The decoder of
 # contracts/zenoh-service-grants/v1 takes the declarations it must take and refuses the ones it must
 # refuse. Each limit is held on both sides of its bound. Each check is removed in turn, and the
