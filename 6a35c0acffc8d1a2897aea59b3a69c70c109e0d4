@@ -1,0 +1,65 @@
+{
+  formatVersion = 1;
+  commit = "6a35c0acffc8d1a2897aea59b3a69c70c109e0d4";
+  hostClass = {
+    devShell = "/nix/store/9bnlhap8980zx5nyc7m4nw3jq4gyi637-nix-shell.drv";
+    architecture = "aarch64";
+  };
+  runner = "ubuntu24-arm64-20261116.188.1";
+  images = [
+    {
+      name = "sel4-call";
+      derivationId = "11ccb2c829a6fc19aa2c50ba89cc400bb72dabf7cbef5512d7b7908389969524";
+      generation = "679e137269568af081be01fcea5bfc82e91428d26046dc552603affeeeb0a8e4";
+      root = "7871feb04337a3ce90ba8735ff2ddb49e964ec6ebd461ae17075a225d7b3282a";
+      loader = "c9f83795d10d31e8b399df1923bc0ed87feffe9846b67b2611c92e261d2fd179";
+      image = "c3b74725fb8876bd38358d0873420963b5417c5e5ef6850110ad15999f040327";
+      identityManifest = "e6711e685f111dccb643e499bdf56bea6a1d88a2b1f87f84be12dc0747a1a222";
+    };
+    {
+      name = "sel4-channel";
+      derivationId = "9daf93a69241a7a9cdc5889281fb0bbdeffa62e50b41be5aed49cadab41503d4";
+      generation = "3a45f2266d08fbe21efed9e67e74b88ee88e1f656e09751236c7242ab16120bf";
+      root = "51b098ef768b1b3bb88a7eb8ebb949b27f287170fdc496d5eb33628469876ab9";
+      loader = "c9f83795d10d31e8b399df1923bc0ed87feffe9846b67b2611c92e261d2fd179";
+      image = "19d865e1c07c3e2e547c01e03a11f85cadf2e7210130007c002da40442f09ebe";
+      identityManifest = "e3396fded35479bd9e7934fd5cdeba8d2724b39e08c2f836f1d0b7cf8cfc81ba";
+    };
+    {
+      name = "sel4-io-driver-reset-in-flight";
+      derivationId = "52406f3f4ca11eaeb6634df97dead3265df0280d0881b173aeeb0b234f9f4b50";
+      generation = "58b340cc97f75f20dfd7531d197d1b5702a3ad183ac183d79cffb525f92adfb9";
+      root = "1144d1935c9d51a3c7fa50c651279907ab924d67d347c2a9eb40586d29163a44";
+      loader = "c9f83795d10d31e8b399df1923bc0ed87feffe9846b67b2611c92e261d2fd179";
+      image = "4463fdaf99e4d2bb48658c35630e29a724b70e9270586ab51378755c3af2b1ff";
+      identityManifest = "88dcc0e8ecb0b0d80c5683bafb251eab789ee7bcc1de5ee24e0565de9326da24";
+    };
+    {
+      name = "sel4-private-memory-adaptive-rv64";
+      derivationId = "5761696683a88eb4e77adb16daf286c3333e9c24c9d40cd9a638d2806189739b";
+      generation = "f044fead2f3003ef28fd964e1a7e7b89d13f4cf7b5f828189dd2c31d777e89ed";
+      root = "99a8e9baeef35255b21223681cd21862ccac139f55304a3bfc75a7c8d245b82f";
+      loader = "3558546e919c80886ebf1f7b5ac070063445511a2cd2aa259c1e5d16ba9113f5";
+      image = "90678f5a28b7c13a67f9b933a3c3e4ee269b1d8044a6f46089e6c83eb9a35b17";
+      identityManifest = "cf2d7446f01db2bea0d27a493fb90b3c149898cbf66329098da7b807bc643c86";
+    };
+    {
+      name = "sel4-private-memory-stress-injected";
+      derivationId = "88985c4f677bfd553bd90dbfc0ebe8d5d5f1bcd5b8f2b4108d8b8a55dbfbdcc8";
+      generation = "27a3b535ccc546084da6c96692c33671d8915810c446a666c8fd7eed06a0d56b";
+      root = "ef463c765bee39c7849e2b614b16d89b23dbc485958257f361411173d28cbfb9";
+      loader = "c9f83795d10d31e8b399df1923bc0ed87feffe9846b67b2611c92e261d2fd179";
+      image = "72f1275976df6d78c730a5d792a72174c6d6d0e33d845f8ed6d652e00e8722ff";
+      identityManifest = "193fe3acfba358b0583e28b9f1b024cababcf278da1f4ba4f23cff59304e5ce3";
+    };
+    {
+      name = "sel4-zenoh";
+      derivationId = "f4b95fd7a15c526c4a7077e5492f4acabcfbf9121ac616f2c627865207df600e";
+      generation = "d378e12c44b6603cc8d44a0ab412d7b30ea83a2d90966f24a56b6e6cc2ec9dfc";
+      root = "8275e2705ec5f88627e1b69f840c8fbc95da65cf5c7350fd231f3dd75cf56f9f";
+      loader = "c9f83795d10d31e8b399df1923bc0ed87feffe9846b67b2611c92e261d2fd179";
+      image = "8cc4dc5b8b67e8b90729fc8121d36d1b66862d46d24c360bcf54329f188ceb8b";
+      identityManifest = "2236c213d650b44dd81143e62b22def68a516a91d08ad4893237f0c0e1b69302";
+    };
+  ];
+}
