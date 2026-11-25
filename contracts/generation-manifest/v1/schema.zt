@@ -210,6 +210,18 @@ PrivateMemoryBudgetEntry :: type {
   holder : Text;
   pageQuota : Int;
 };
+-- The PCI function one driver instance drives (io-resource/v2). A root that
+-- binds PCI functions reads `vendor` and `deviceId` from the configuration
+-- space at `bus`, `device` and `function`, and refuses the generation when
+-- they differ. A root that binds none refuses every declared function.
+PciFunctionEntry :: type {
+  bus : Int;
+  device : Int;
+  function : Int;
+  vendor : Int;
+  deviceId : Int;
+};
+
 -- IO1 per-driver hardware-resource ceilings. The holder is the authenticated
 -- instance identity; omission denies every IO-resource operation.
 IoResourceBudgetEntry :: type {
@@ -234,6 +246,8 @@ IoResourceBudgetEntry :: type {
   -- authority at once, so the four cannot disagree about which transport they
   -- mean. Two holders naming one device is refused: a transport is exclusive.
   device? : Int;
+  -- Omitted when the driver instance drives no PCI function.
+  pciFunction? : PciFunctionEntry;
 };
 
 -- B83 exact per-ring block authority. Each entry binds one client instance,
